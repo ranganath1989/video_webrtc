@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebRTC Call POC</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font:14px system-ui,sans-serif;background:#111;color:#eee;height:100dvh;display:flex;flex-direction:column}
+#lobby{margin:auto;display:grid;gap:10px;width:min(320px,90vw)}
+input,select,button{padding:8px 10px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;font:inherit}
+button{cursor:pointer}
+button.on{background:#c0392b;border-color:#c0392b}
+#call{display:none;flex:1;min-height:0;flex-direction:column}
+#main{flex:1;display:flex;min-height:0}
+#grid{flex:1;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;padding:8px;overflow:auto;align-content:start}
+.tile{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9}
+.tile.big{grid-column:1/-1}
+.tile video{width:100%;height:100%;object-fit:cover}
+.tile.big video{object-fit:contain}
+.tile span{position:absolute;left:8px;bottom:6px;background:#0009;padding:2px 6px;border-radius:6px;font-size:12px}
+#chat{width:280px;display:none;flex-direction:column;border-left:1px solid #333}
+#chat.open{display:flex}
+#log{flex:1;overflow:auto;padding:8px}
+#log p{margin:0 0 6px;word-break:break-word}
+#log a{color:#6cb6ff}
+#chat form{display:flex;gap:4px;padding:8px}
+#msg{flex:1;min-width:0}
+#bar{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;padding:8px;border-top:1px solid #333}
+@media(max-width:640px){#chat.open{position:fixed;inset:0;width:auto;background:#111;z-index:5}}
+</style>
+</head>
+<body>
+<div id="lobby">
+  <h2>WebRTC call POC</h2>
+  <input id="name" placeholder="Your name">
+  <input id="room" placeholder="Room" value="demo">
+  <label><input type="checkbox" id="audioOnly"> Audio-only call</label>
+  <button id="joinBtn">Join</button>
+</div>
+
+<div id="call">
+  <div id="main">
+    <div id="grid"></div>
+    <aside id="chat">
+      <div id="log"></div>
+      <form id="chatForm">
+        <input id="msg" autocomplete="off" placeholder="Message">
+        <button type="button" id="fileBtn" title="Share a file">📎</button>
+        <button>Send</button>
+        <input type="file" id="fileIn" hidden>
+      </form>
+    </aside>
+  </div>
+  <div id="bar">
+    <button id="micBtn">Mute</button>
+    <button id="camBtn">Camera off</button>
+    <button id="shareBtn">Share screen</button>
+    <button id="recBtn">Record</button>
+    <select id="bgSel">
+      <option value="none">No background</option>
+      <option value="blur">Blur</option>
+      <option value="color">Gradient</option>
+      <option value="image">Image…</option>
+    </select>
+    <input type="file" id="bgFile" accept="image/*" hidden>
+    <button id="chatBtn">Chat</button>
+    <button id="leaveBtn">Leave</button>
+  </div>
+</div>
+
+<script src="/config.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/selfie_segmentation.js" crossorigin="anonymous"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const socket = io();
+const peers = {};                                   // id -> { pc, dc, stream, name, vSender, q, sharing, incoming, tile }
+const ICE = window.__ICE_CONFIG__ || { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const W = 1280, H = 720, CHUNK = 16384, MAX_FILE = 50 * 1024 * 1024;
+const chatLog = [];                                 // also drawn into recordings
+let cam, screenTrack, bgMode = 'none', bgImg, seg, pctx, procTrack, camVid;
+let looping = false, loopId = 0, audioOnly = false, rec, recMix = null;
+
+// ---------- Outgoing video: screen > virtual-background canvas > raw camera ----------
+const outTrack = () => screenTrack || (bgMode !== 'none' && procTrack) || cam.getVideoTracks()[0] || null;
+
+function refresh() {
+  const t = outTrack();
+  Object.values(peers).forEach((p) => p.vSender.replaceTrack(t)); // no renegotiation needed
+  const s = new MediaStream(cam.getAudioTracks());
+  if (t) s.addTrack(t);
+  $('t-me').querySelector('video').srcObject = s;
+}
+
+function addTile(id, label, stream, mute) {
+  const d = document.createElement('div'); d.className = 'tile'; d.id = 't-' + id;
+  const v = document.createElement('video');
+  v.autoplay = true; v.playsInline = true; v.muted = !!mute; v.srcObject = stream;
+  const s = document.createElement('span'); s.textContent = label;
+  d.append(v, s); $('grid').append(d); return d;
+}
+
+function broadcast(obj) {
+  const s = JSON.stringify(obj);
+  Object.values(peers).forEach((p) => p.dc?.readyState === 'open' && p.dc.send(s));
+}
+
+// ---------- Join ----------
+$('joinBtn').onclick = async () => {
+  const name = $('name').value.trim() || 'Guest';
+  audioOnly = $('audioOnly').checked;
+  try {
+    cam = await navigator.mediaDevices.getUserMedia({ audio: true, video: audioOnly ? false : { width: W, height: H } });
+  } catch (e) { return alert('Cannot access devices: ' + e.message); }
+  $('lobby').style.display = 'none'; $('call').style.display = 'flex';
+  if (audioOnly) { $('camBtn').hidden = true; $('bgSel').hidden = true; }
+  addTile('me', name + ' (you)', cam, true); refresh();
+  socket.emit('join', { room: $('room').value.trim() || 'demo', name });
+};
+
+// ---------- Peer connections (full mesh) ----------
+function makePeer(id, name, initiator) {
+  const pc = new RTCPeerConnection(ICE);
+  const p = { pc, name, stream: new MediaStream(), q: Promise.resolve(), sharing: false };
+  peers[id] = p;
+
+  cam.getAudioTracks().forEach((t) => pc.addTrack(t, cam));
+  const vt = outTrack();
+  // Always have a video sender so screen share works even in audio-only calls
+  p.vSender = vt ? pc.addTrack(vt, cam) : pc.addTransceiver('video').sender;
+
+  pc.onicecandidate = (e) => e.candidate && socket.emit('signal', { to: id, data: { candidate: e.candidate } });
+  pc.ontrack = (e) => {
+    p.stream.addTrack(e.track);
+    if (!p.tile) { p.tile = addTile(id, name, p.stream); p.tile.classList.toggle('big', p.sharing); }
+    // someone joining mid-recording: add their audio to the live mix
+    if (recMix && e.track.kind === 'audio')
+      recMix.ac.createMediaStreamSource(new MediaStream([e.track])).connect(recMix.dest);
+  };
+  pc.onconnectionstatechange = () => ['failed', 'closed'].includes(pc.connectionState) && removePeer(id);
+
+  if (initiator) {
+    setupDC(p, pc.createDataChannel('chat'));
+    pc.createOffer()
+      .then((o) => pc.setLocalDescription(o))
+      .then(() => socket.emit('signal', { to: id, data: { sdp: pc.localDescription } }));
+  } else {
+    pc.ondatachannel = (e) => setupDC(p, e.channel);
+  }
+  return p;
+}
+
+function removePeer(id) {
+  const p = peers[id]; if (!p) return;
+  p.pc.close(); p.tile?.remove(); delete peers[id];
+}
+
+socket.on('peers', (list) => list.forEach((x) => makePeer(x.id, x.name, true)));
+socket.on('peer-left', removePeer);
+socket.on('signal', ({ from, name, data }) => {
+  const p = peers[from] || makePeer(from, name, false);
+  p.q = p.q.then(async () => {                      // serialize so ICE never beats the SDP
+    const pc = p.pc;
+    if (data.sdp) {
+      await pc.setRemoteDescription(data.sdp);
+      if (data.sdp.type === 'offer') {
+        await pc.setLocalDescription(await pc.createAnswer());
+        socket.emit('signal', { to: from, data: { sdp: pc.localDescription } });
+      }
+    } else if (data.candidate) {
+      await pc.addIceCandidate(data.candidate).catch(() => {});
+    }
+  });
+});
+
+// ---------- Data channel: chat, share-state and file transfer (all peer-to-peer) ----------
+function setupDC(p, dc) {
+  p.dc = dc; dc.binaryType = 'arraybuffer';
+  dc.onopen = () => dc.send(JSON.stringify({ t: 'share', on: !!screenTrack }));
+  dc.onmessage = (e) => {
+    if (typeof e.data !== 'string') { p.incoming?.chunks.push(e.data); return; } // binary = file chunk
+    const m = JSON.parse(e.data);
+    if (m.t === 'chat') { addMsg(p.name, m.text); $('chat').classList.add('open'); }
+    else if (m.t === 'share') { p.sharing = m.on; p.tile?.classList.toggle('big', m.on); }
+    else if (m.t === 'file') p.incoming = { meta: m, chunks: [] };
+    else if (m.t === 'file-end' && p.incoming) {
+      const { meta, chunks } = p.incoming; p.incoming = null;
+      const url = URL.createObjectURL(new Blob(chunks, { type: meta.mime }));
+      addMsg(p.name, 'shared a file: ' + meta.name, { url, name: meta.name });
+      $('chat').classList.add('open');
+    }
+  };
+}
+
+function addMsg(who, text, file) {
+  chatLog.push({ who, text });
+  const p = document.createElement('p'), b = document.createElement('b');
+  b.textContent = who + ': '; p.append(b, document.createTextNode(text + (file ? ' ' : '')));
+  if (file) { const a = document.createElement('a'); a.href = file.url; a.download = file.name; a.textContent = '[download]'; p.append(a); }
+  $('log').append(p); $('log').scrollTop = 1e9;
+}
+
+$('chatForm').onsubmit = (e) => {
+  e.preventDefault();
+  const t = $('msg').value.trim(); if (!t) return;
+  broadcast({ t: 'chat', text: t });
+  addMsg('You', t); $('msg').value = '';
+};
+$('chatBtn').onclick = () => $('chat').classList.toggle('open');
+
+$('fileBtn').onclick = () => $('fileIn').click();
+$('fileIn').onchange = async (e) => {
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  if (f.size > MAX_FILE) return alert('POC limit is 50 MB per file');
+  const open = Object.values(peers).filter((p) => p.dc?.readyState === 'open');
+  if (!open.length) return alert('No one else is connected yet');
+  addMsg('You', 'shared a file: ' + f.name);
+  const buf = await f.arrayBuffer();
+  await Promise.all(open.map(async (p) => {
+    const dc = p.dc;
+    dc.send(JSON.stringify({ t: 'file', name: f.name, size: f.size, mime: f.type }));
+    for (let o = 0; o < buf.byteLength; o += CHUNK) {
+      while (dc.bufferedAmount > 64 * CHUNK) await new Promise((r) => setTimeout(r, 20)); // backpressure
+      dc.send(buf.slice(o, o + CHUNK));
+    }
+    dc.send(JSON.stringify({ t: 'file-end' }));
+  }));
+};
+
+// ---------- Controls: mic / camera ----------
+function toggleTrack(track, btn, onText, offText) {
+  track.enabled = !track.enabled;
+  btn.textContent = track.enabled ? onText : offText;
+  btn.classList.toggle('on', !track.enabled);
+}
+$('micBtn').onclick = (e) => toggleTrack(cam.getAudioTracks()[0], e.target, 'Mute', 'Unmute');
+$('camBtn').onclick = (e) => toggleTrack(cam.getVideoTracks()[0], e.target, 'Camera off', 'Camera on');
+$('leaveBtn').onclick = () => location.reload();
+
+// ---------- Screen share ----------
+$('shareBtn').onclick = async (e) => {
+  if (screenTrack) return stopShare();
+  try {
+    const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    screenTrack = s.getVideoTracks()[0]; screenTrack.onended = stopShare;
+    e.target.textContent = 'Stop sharing'; e.target.classList.add('on');
+    $('t-me').classList.add('big'); refresh(); broadcast({ t: 'share', on: true });
+  } catch (err) { alert('Screen share unavailable: ' + err.message); }
+};
+function stopShare() {
+  screenTrack?.stop(); screenTrack = null;
+  $('shareBtn').textContent = 'Share screen'; $('shareBtn').classList.remove('on');
+  $('t-me').classList.remove('big'); refresh(); broadcast({ t: 'share', on: false });
+}
+
+// ---------- Virtual backgrounds (MediaPipe selfie segmentation -> canvas -> track) ----------
+$('bgSel').onchange = (e) => (e.target.value === 'image' ? $('bgFile').click() : setBg(e.target.value));
+$('bgFile').onchange = (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image(); img.onload = () => { bgImg = img; setBg('image'); }; img.src = URL.createObjectURL(f);
+};
+
+async function setBg(mode) {
+  bgMode = mode;
+  if (mode === 'none') { looping = false; return refresh(); }
+  if (!seg) {
+    seg = new SelfieSegmentation({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/${f}` });
+    seg.setOptions({ modelSelection: 1 }); seg.onResults(drawFrame);
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    pctx = c.getContext('2d'); procTrack = c.captureStream(30).getVideoTracks()[0];
+    camVid = document.createElement('video'); camVid.muted = true; camVid.playsInline = true;
+    camVid.srcObject = new MediaStream(cam.getVideoTracks()); await camVid.play();
+  }
+  if (!looping) {
+    looping = true; const me = ++loopId;
+    (async function loop() {
+      if (!looping || me !== loopId) return;
+      try { await seg.send({ image: camVid }); } catch {}
+      requestAnimationFrame(loop);
+    })();
+  }
+  refresh();
+}
+
+function drawFrame(r) {
+  const c = pctx; c.save(); c.clearRect(0, 0, W, H);
+  c.drawImage(r.segmentationMask, 0, 0, W, H);                 // person mask
+  c.globalCompositeOperation = 'source-in'; c.drawImage(r.image, 0, 0, W, H);   // keep person only
+  c.globalCompositeOperation = 'destination-over';             // paint background behind
+  if (bgMode === 'blur') { c.filter = 'blur(14px)'; c.drawImage(r.image, 0, 0, W, H); }
+  else if (bgMode === 'image' && bgImg) c.drawImage(bgImg, 0, 0, W, H);
+  else { const g = c.createLinearGradient(0, 0, W, H); g.addColorStop(0, '#1e3c72'); g.addColorStop(1, '#2a5298'); c.fillStyle = g; c.fillRect(0, 0, W, H); }
+  c.restore();
+}
+
+// ---------- Full-call recording: video grid / screen share + chat panel + mixed audio ----------
+function wrap(c, text, maxW) {
+  const out = []; let line = '';
+  for (const w of text.split(' ')) {
+    const t = line ? line + ' ' + w : w;
+    if (c.measureText(t).width > maxW && line) { out.push(line); line = w; } else line = t;
+  }
+  if (line) out.push(line); return out;
+}
+function fit(c, v, x, y, w, h) {                               // draw video letterboxed inside a box
+  if (!v.videoWidth) return;
+  const s = Math.min(w / v.videoWidth, h / v.videoHeight), dw = v.videoWidth * s, dh = v.videoHeight * s;
+  c.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+}
+function label(c, t, x, bottom) {
+  c.font = '14px sans-serif';
+  c.fillStyle = '#000a'; c.fillRect(x + 6, bottom - 24, c.measureText(t).width + 12, 20);
+  c.fillStyle = '#fff'; c.fillText(t, x + 12, bottom - 9);
+}
+function drawRec(c) {
+  const VW = W - 320;                                          // left: video area, right: 320px chat panel
+  c.fillStyle = '#000'; c.fillRect(0, 0, W, H);
+  const tiles = [...document.querySelectorAll('#grid .tile')].map((t) => ({
+    id: t.id, v: t.querySelector('video'), name: t.querySelector('span').textContent,
+  }));
+  const pres = tiles.find((t) => (t.id === 't-me' ? !!screenTrack : peers[t.id.slice(2)]?.sharing));
+  if (pres) {                                                  // screen share: big view + thumbnail strip
+    const others = tiles.filter((t) => t !== pres), th = others.length ? 120 : 0;
+    const tw = Math.min(200, VW / Math.max(others.length, 1));
+    fit(c, pres.v, 0, 0, VW, H - th); label(c, pres.name + ' – screen', 0, H - th || H);
+    others.forEach((t, i) => { fit(c, t.v, i * tw, H - th, tw, th); label(c, t.name, i * tw, H); });
+  } else {                                                     // normal grid
+    const n = Math.max(tiles.length, 1), cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+    const w = VW / cols, h = H / rows;
+    tiles.forEach((t, i) => {
+      const x = (i % cols) * w, y = Math.floor(i / cols) * h;
+      fit(c, t.v, x, y, w, h); label(c, t.name, x, y + h);
+    });
+  }
+  c.fillStyle = '#181818'; c.fillRect(VW, 0, 320, H);          // chat panel
+  c.fillStyle = '#fff'; c.font = 'bold 16px sans-serif'; c.fillText('Chat', VW + 14, 28);
+  c.font = '14px sans-serif';
+  const lines = []; chatLog.forEach((m) => wrap(c, m.who + ': ' + m.text, 292).forEach((l) => lines.push(l)));
+  let y = H - 14;
+  for (let i = lines.length - 1; i >= 0 && y > 48; i--, y -= 19) { c.fillStyle = '#ddd'; c.fillText(lines[i], VW + 14, y); }
+}
+
+$('recBtn').onclick = (e) => {
+  if (rec) return rec.stop();
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d');
+  const timer = setInterval(() => drawRec(c), 40);             // keep this tab visible while recording
+  const ac = new AudioContext(), dest = ac.createMediaStreamDestination();
+  recMix = { ac, dest };
+  [cam, ...Object.values(peers).map((p) => p.stream)].forEach((s) =>
+    s.getAudioTracks().forEach((t) => ac.createMediaStreamSource(new MediaStream([t])).connect(dest)));
+  const out = new MediaStream([...cv.captureStream(25).getVideoTracks(), ...dest.stream.getAudioTracks()]);
+  const mime = MediaRecorder.isTypeSupported('video/webm') ? 'video/webm' : 'video/mp4';
+  const chunks = []; rec = new MediaRecorder(out, { mimeType: mime });
+  rec.ondataavailable = (ev) => chunks.push(ev.data);
+  rec.onstop = () => {
+    clearInterval(timer); ac.close(); recMix = null;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(chunks, { type: mime }));
+    a.download = 'call-' + Date.now() + (mime === 'video/webm' ? '.webm' : '.mp4'); a.click();
+    rec = null; e.target.textContent = 'Record'; e.target.classList.remove('on');
+  };
+  rec.start(1000); e.target.textContent = 'Stop recording'; e.target.classList.add('on');
+};
+</script>
+</body>
+</html>

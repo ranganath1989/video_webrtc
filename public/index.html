@@ -22,13 +22,16 @@ button.on{background:#c0392b;border-color:#c0392b}
 .tile span{position:absolute;left:8px;bottom:6px;background:#0009;padding:2px 6px;border-radius:6px;font-size:12px}
 #chat{width:280px;display:none;flex-direction:column;border-left:1px solid #333}
 #chat.open{display:flex}
+#chatHeader{display:flex;align-items:center;justify-content:space-between;padding:8px;border-bottom:1px solid #333;background:#181818}
+#chatTitle{font-weight:700}
+#chatCloseBtn{padding:4px 8px;border:1px solid #444;background:#222;color:#eee;border-radius:6px;cursor:pointer}
 #log{flex:1;overflow:auto;padding:8px}
 #log p{margin:0 0 6px;word-break:break-word}
 #log a{color:#6cb6ff}
 #chat form{display:flex;gap:4px;padding:8px}
 #msg{flex:1;min-width:0}
 #bar{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;padding:8px;border-top:1px solid #333}
-@media(max-width:640px){#chat.open{position:fixed;inset:0;width:auto;background:#111;z-index:5}}
+@media(max-width:640px){#chat.open{position:fixed;inset:0;width:auto;background:#111;z-index:5}#chat{width:100%}}
 </style>
 </head>
 <body>
@@ -44,6 +47,10 @@ button.on{background:#c0392b;border-color:#c0392b}
   <div id="main">
     <div id="grid"></div>
     <aside id="chat">
+      <div id="chatHeader">
+        <span id="chatTitle">Chat</span>
+        <button type="button" id="chatCloseBtn" title="Close chat">Close</button>
+      </div>
       <div id="log"></div>
       <form id="chatForm">
         <input id="msg" autocomplete="off" placeholder="Message">
@@ -82,6 +89,25 @@ const W = 1280, H = 720, CHUNK = 16384, MAX_FILE = 50 * 1024 * 1024;
 const chatLog = [];                                 // also drawn into recordings
 let cam, screenTrack, bgMode = 'none', bgImg, seg, pctx, procTrack, camVid;
 let looping = false, loopId = 0, audioOnly = false, rec, recMix = null;
+let chatOpen = false;
+
+function setChatOpen(open) {
+  chatOpen = open;
+  $('chat').classList.toggle('open', open);
+  if (open) {
+    const last = window.history.state;
+    if (!last || !last.chatOpen) {
+      window.history.pushState({ chatOpen: true }, '', window.location.href);
+    }
+  }
+}
+
+window.addEventListener('popstate', () => {
+  if (chatOpen) {
+    setChatOpen(false);
+    window.history.pushState({ chatOpen: false }, '', window.location.href);
+  }
+});
 
 // ---------- Outgoing video: screen > virtual-background canvas > raw camera ----------
 const outTrack = () => screenTrack || (bgMode !== 'none' && procTrack) || cam.getVideoTracks()[0] || null;
@@ -208,7 +234,8 @@ $('chatForm').onsubmit = (e) => {
   broadcast({ t: 'chat', text: t });
   addMsg('You', t); $('msg').value = '';
 };
-$('chatBtn').onclick = () => $('chat').classList.toggle('open');
+$('chatBtn').onclick = () => setChatOpen(!chatOpen);
+$('chatCloseBtn').onclick = () => setChatOpen(false);
 
 $('fileBtn').onclick = () => $('fileIn').click();
 $('fileIn').onchange = async (e) => {

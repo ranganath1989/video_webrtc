@@ -3,20 +3,36 @@ const express = require('express');
 const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
+const twilio = require('twilio');
  
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-app.get('/config.js', (req, res) => {
-  const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
-  const turnUrl = process.env.TURN_URL;
+app.get('/config.js', async (req, res) => {
+  let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 
-  if (turnUrl) {
-    const turnServer = { urls: turnUrl };
-    if (process.env.TURN_USERNAME) turnServer.username = process.env.TURN_USERNAME;
-    if (process.env.TURN_PASSWORD) turnServer.credential = process.env.TURN_PASSWORD;
-    iceServers.push(turnServer);
+  try {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+    if (accountSid && authToken) {
+      const client = twilio(accountSid, authToken);
+      const token = await client.tokens.create();
+      if (Array.isArray(token.iceServers) && token.iceServers.length) {
+        iceServers = token.iceServers;
+      }
+    } else {
+      const turnUrl = process.env.TURN_URL;
+      if (turnUrl) {
+        const turnServer = { urls: turnUrl };
+        if (process.env.TURN_USERNAME) turnServer.username = process.env.TURN_USERNAME;
+        if (process.env.TURN_PASSWORD) turnServer.credential = process.env.TURN_PASSWORD;
+        iceServers.push(turnServer);
+      }
+    }
+  } catch (err) {
+    // Fall back to Google STUN if Twilio config is unavailable.
   }
 
   res.type('application/javascript').send(`window.__ICE_CONFIG__ = ${JSON.stringify({ iceServers })};`);
